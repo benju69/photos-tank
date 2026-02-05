@@ -1,0 +1,31 @@
+{
+  "name": "photos-tank",
+  "version": "1.0.0",
+  "description": "Easy Guest Photo Sharing for Weddings & Events",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/benju69/photos-tank.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/benju69/photos-tank/issues"
+  },
+  "homepage": "https://github.com/benju69/photos-tank#readme",
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "multer": "^2.0.2",
+    "qrcode": "^1.5.4",
+    "uuid": "^13.0.0"
+  }
+}
