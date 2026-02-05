@@ -3,6 +3,7 @@ const multer = require('multer');
 const QRCode = require('qrcode');
 const archiver = require('archiver');
 const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 const { v4: uuidv4 } = require('uuid');
 const fs = require('fs');
 const path = require('path');
@@ -10,11 +11,25 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Rate limiting middleware
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per windowMs
+  message: 'Too many requests from this IP, please try again later.'
+});
+
+const uploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 20, // Limit uploads to 20 per 15 minutes
+  message: 'Too many uploads from this IP, please try again later.'
+});
+
 // Middleware
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 app.use('/uploads', express.static('uploads'));
+app.use('/api/', apiLimiter); // Apply rate limiting to all API routes
 
 // Ensure directories exist
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
@@ -58,12 +73,18 @@ function readEvents() {
     const data = fs.readFileSync(EVENTS_FILE, 'utf8');
     return JSON.parse(data);
   } catch (error) {
+    console.error('Error reading events file:', error.message);
     return [];
   }
 }
 
 function writeEvents(events) {
-  fs.writeFileSync(EVENTS_FILE, JSON.stringify(events, null, 2));
+  try {
+    fs.writeFileSync(EVENTS_FILE, JSON.stringify(events, null, 2));
+  } catch (error) {
+    console.error('Error writing events file:', error.message);
+    throw error;
+  }
 }
 
 function findEvent(eventId) {
@@ -136,7 +157,7 @@ app.get('/api/events/:eventId', (req, res) => {
 });
 
 // Upload files to an event
-app.post('/api/events/:eventId/upload', upload.array('files', 20), (req, res) => {
+app.post('/api/events/:eventId/upload', uploadLimiter, upload.array('files', 20), (req, res) => {
   try {
     const { eventId } = req.params;
     const { guestName, message } = req.body;
@@ -162,6 +183,9 @@ app.post('/api/events/:eventId/upload', upload.array('files', 20), (req, res) =>
     
     const events = readEvents();
     const eventIndex = events.findIndex(e => e.id === eventId);
+    if (eventIndex === -1) {
+      return res.status(404).json({ error: 'Event not found in database' });
+    }
     events[eventIndex] = event;
     writeEvents(events);
     
@@ -226,7 +250,10 @@ app.get('/api/events/:eventId/download', (req, res) => {
     files.forEach(file => {
       const filePath = path.join(eventDir, file);
       const upload = event.uploads.find(u => u.filename === file);
-      const guestName = upload ? upload.guestName : 'unknown';
+      const guestName = upload ? upload.guestName : 'untracked';
+      if (!upload) {
+        console.warn(`File ${file} found in directory but not in event metadata`);
+      }
       archive.file(filePath, { name: `${guestName}_${file}` });
     });
     
