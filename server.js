@@ -1,12 +1,17 @@
-const express = require('express');
-const multer = require('multer');
-const QRCode = require('qrcode');
-const archiver = require('archiver');
-const cors = require('cors');
-const rateLimit = require('express-rate-limit');
-const { v4: uuidv4 } = require('uuid');
-const fs = require('fs');
-const path = require('path');
+import express from 'express';
+import multer from 'multer';
+import QRCode from 'qrcode';
+import archiver from 'archiver';
+import cors from 'cors';
+import rateLimit from 'express-rate-limit';
+import { v4 as uuidv4 } from 'uuid';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3001;
