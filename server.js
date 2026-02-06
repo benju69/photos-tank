@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import multer from 'multer';
 import QRCode from 'qrcode';
@@ -9,9 +10,18 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
+import { v2 as cloudinary } from 'cloudinary';
+import fetch from 'node-fetch';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+
+// Configure Cloudinary
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -37,23 +47,18 @@ app.use(express.json());
 app.use((req, res, next) => {
   res.setHeader(
     'Content-Security-Policy',
-    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'"
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://res.cloudinary.com; media-src 'self' blob: https://res.cloudinary.com; connect-src 'self'"
   );
   next();
 });
 
 app.use(express.static('public'));
-app.use('/uploads', express.static('uploads'));
 app.use('/api/', apiLimiter); // Apply rate limiting to all API routes
 
-// Ensure directories exist
-const UPLOADS_DIR = path.join(__dirname, 'uploads');
+// Ensure data directory exists
 const DATA_DIR = path.join(__dirname, 'data');
 const EVENTS_FILE = path.join(DATA_DIR, 'events.json');
 
-if (!fs.existsSync(UPLOADS_DIR)) {
-  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-}
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
@@ -61,21 +66,8 @@ if (!fs.existsSync(EVENTS_FILE)) {
   fs.writeFileSync(EVENTS_FILE, JSON.stringify([], null, 2));
 }
 
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const eventId = req.params.eventId || req.body.eventId;
-    const eventDir = path.join(UPLOADS_DIR, eventId);
-    if (!fs.existsSync(eventDir)) {
-      fs.mkdirSync(eventDir, { recursive: true });
-    }
-    cb(null, eventDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueName = `${Date.now()}-${uuidv4()}${path.extname(file.originalname)}`;
-    cb(null, uniqueName);
-  }
-});
+// Configure multer for memory storage (files will be uploaded to Cloudinary)
+const storage = multer.memoryStorage();
 
 // Allowed file types for uploads
 const ALLOWED_MIME_TYPES = new Set([
@@ -105,7 +97,7 @@ const ALLOWED_EXTENSIONS = new Set([
 
 const upload = multer({ 
   storage,
-  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB limit
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit (Cloudinary free tier)
   fileFilter: (req, file, cb) => {
     const ext = path.extname(file.originalname || '').toLowerCase();
 
@@ -201,12 +193,6 @@ app.post('/api/events', async (req, res) => {
     events.push(newEvent);
     writeEvents(events);
     
-    // Create event directory
-    const eventDir = path.join(UPLOADS_DIR, eventId);
-    if (!fs.existsSync(eventDir)) {
-      fs.mkdirSync(eventDir, { recursive: true });
-    }
-    
     res.json(newEvent);
   } catch (error) {
     console.error('Error creating event:', error);
@@ -240,8 +226,9 @@ app.get('/api/events/:eventId', (req, res) => {
 });
 
 // Upload files to an event
-app.post('/api/events/:eventId/upload', uploadLimiter, upload.array('files', 20), (req, res) => {
+app.post('/api/events/:eventId/upload', uploadLimiter, upload.array('files', 20), async (req, res) => {
   const uploadedFiles = req.files || [];
+  const cloudinaryPublicIds = []; // Track uploaded files for cleanup on error
   
   try {
     const { eventId } = req.params;
@@ -249,26 +236,10 @@ app.post('/api/events/:eventId/upload', uploadLimiter, upload.array('files', 20)
     
     // Validate inputs
     if (!guestName || !validateInputLength(guestName, 100)) {
-      // Clean up uploaded files
-      uploadedFiles.forEach(file => {
-        try {
-          fs.unlinkSync(file.path);
-        } catch (err) {
-          console.error('Error deleting file:', file.path, err);
-        }
-      });
       return res.status(400).json({ error: 'Guest name is required and must be less than 100 characters' });
     }
     
     if (message && !validateInputLength(message, 500)) {
-      // Clean up uploaded files
-      uploadedFiles.forEach(file => {
-        try {
-          fs.unlinkSync(file.path);
-        } catch (err) {
-          console.error('Error deleting file:', file.path, err);
-        }
-      });
       return res.status(400).json({ error: 'Message must be less than 500 characters' });
     }
     
@@ -278,27 +249,50 @@ app.post('/api/events/:eventId/upload', uploadLimiter, upload.array('files', 20)
     
     const event = findEvent(eventId);
     if (!event) {
-      // Clean up uploaded files
-      uploadedFiles.forEach(file => {
-        try {
-          fs.unlinkSync(file.path);
-        } catch (err) {
-          console.error('Error deleting file:', file.path, err);
-        }
-      });
       return res.status(404).json({ error: 'Event not found' });
     }
     
-    const uploadedFileRecords = uploadedFiles.map(file => ({
+    // Upload files to Cloudinary
+    const uploadPromises = uploadedFiles.map(file => {
+      return new Promise((resolve, reject) => {
+        const uploadStream = cloudinary.uploader.upload_stream(
+          {
+            folder: `photos-tank/${eventId}`,
+            resource_type: 'auto',
+            public_id: `${Date.now()}-${uuidv4()}`,
+            context: {
+              guest_name: sanitizedGuestName,
+              event_id: eventId
+            }
+          },
+          (error, result) => {
+            if (error) {
+              reject(error);
+            } else {
+              resolve(result);
+            }
+          }
+        );
+        uploadStream.end(file.buffer);
+      });
+    });
+    
+    const cloudinaryResults = await Promise.all(uploadPromises);
+    cloudinaryResults.forEach(result => cloudinaryPublicIds.push(result.public_id));
+    
+    // Create file records
+    const uploadedFileRecords = cloudinaryResults.map((result, index) => ({
       id: uuidv4(),
-      filename: file.filename,
-      originalName: file.originalname,
-      path: `/uploads/${eventId}/${file.filename}`,
-      type: file.mimetype,
-      size: file.size,
+      filename: result.public_id,
+      originalName: uploadedFiles[index].originalname,
+      path: result.secure_url,
+      thumbnailUrl: result.eager?.[0]?.secure_url || result.secure_url,
+      type: uploadedFiles[index].mimetype,
+      size: result.bytes,
       guestName: sanitizedGuestName,
       message: sanitizedMessage,
-      uploadedAt: new Date().toISOString()
+      uploadedAt: new Date().toISOString(),
+      cloudinaryPublicId: result.public_id
     }));
     
     event.uploads.push(...uploadedFileRecords);
@@ -306,14 +300,14 @@ app.post('/api/events/:eventId/upload', uploadLimiter, upload.array('files', 20)
     const events = readEvents();
     const eventIndex = events.findIndex(e => e.id === eventId);
     if (eventIndex === -1) {
-      // Clean up uploaded files
-      uploadedFiles.forEach(file => {
-        try {
-          fs.unlinkSync(file.path);
-        } catch (err) {
-          console.error('Error deleting file:', file.path, err);
-        }
-      });
+      // Rollback: delete uploaded files from Cloudinary
+      await Promise.all(
+        cloudinaryPublicIds.map(publicId =>
+          cloudinary.uploader.destroy(publicId).catch(err =>
+            console.error('Error deleting from Cloudinary:', publicId, err)
+          )
+        )
+      );
       return res.status(404).json({ error: 'Event not found in database' });
     }
     
@@ -322,14 +316,14 @@ app.post('/api/events/:eventId/upload', uploadLimiter, upload.array('files', 20)
     try {
       writeEvents(events);
     } catch (writeError) {
-      // If database write fails, clean up uploaded files to prevent orphaned files
-      uploadedFiles.forEach(file => {
-        try {
-          fs.unlinkSync(file.path);
-        } catch (err) {
-          console.error('Error deleting file:', file.path, err);
-        }
-      });
+      // Rollback: delete uploaded files from Cloudinary
+      await Promise.all(
+        cloudinaryPublicIds.map(publicId =>
+          cloudinary.uploader.destroy(publicId).catch(err =>
+            console.error('Error deleting from Cloudinary:', publicId, err)
+          )
+        )
+      );
       throw writeError;
     }
     
@@ -340,16 +334,16 @@ app.post('/api/events/:eventId/upload', uploadLimiter, upload.array('files', 20)
     });
   } catch (error) {
     console.error('Error uploading files:', error);
-    // Clean up uploaded files on any error
-    uploadedFiles.forEach(file => {
-      try {
-        if (fs.existsSync(file.path)) {
-          fs.unlinkSync(file.path);
-        }
-      } catch (err) {
-        console.error('Error deleting file:', file.path, err);
-      }
-    });
+    // Rollback: delete any successfully uploaded files from Cloudinary
+    if (cloudinaryPublicIds.length > 0) {
+      await Promise.all(
+        cloudinaryPublicIds.map(publicId =>
+          cloudinary.uploader.destroy(publicId).catch(err =>
+            console.error('Error deleting from Cloudinary:', publicId, err)
+          )
+        )
+      );
+    }
     res.status(500).json({ error: 'Failed to upload files' });
   }
 });
@@ -373,15 +367,14 @@ app.get('/api/events/:eventId/gallery', (req, res) => {
 });
 
 // Download event gallery as ZIP
-app.get('/api/events/:eventId/download', (req, res) => {
+app.get('/api/events/:eventId/download', async (req, res) => {
   try {
     const event = findEvent(req.params.eventId);
     if (!event) {
       return res.status(404).json({ error: 'Event not found' });
     }
     
-    const eventDir = path.join(UPLOADS_DIR, req.params.eventId);
-    if (!fs.existsSync(eventDir)) {
+    if (!event.uploads || event.uploads.length === 0) {
       return res.status(404).json({ error: 'No files to download' });
     }
     
@@ -405,28 +398,61 @@ app.get('/api/events/:eventId/download', (req, res) => {
     
     archive.pipe(res);
     
-    // Add all files from event directory
-    const files = fs.readdirSync(eventDir);
-    files.forEach(file => {
-      const filePath = path.join(eventDir, file);
-      const upload = event.uploads.find(u => u.filename === file);
-      const guestName = upload ? upload.guestName : 'untracked';
-      if (!upload) {
-        console.warn(`File ${file} found in directory but not in event metadata`);
+    // Download files from Cloudinary and add to archive
+    for (const upload of event.uploads) {
+      try {
+        const response = await fetch(upload.path);
+        if (!response.ok) {
+          console.error(`Failed to fetch ${upload.path}: ${response.statusText}`);
+          continue;
+        }
+        
+        const buffer = await response.arrayBuffer();
+        const ext = path.extname(upload.originalName) || '.jpg';
+        const filename = `${upload.guestName}_${upload.id}${ext}`;
+        
+        archive.append(Buffer.from(buffer), { name: filename });
+      } catch (error) {
+        console.error(`Error downloading file ${upload.path}:`, error);
+        // Continue with other files even if one fails
       }
-      archive.file(filePath, { name: `${guestName}_${file}` });
-    });
+    }
     
-    archive.finalize();
+    await archive.finalize();
   } catch (error) {
     console.error('Error downloading gallery:', error);
-    res.status(500).json({ error: 'Failed to download gallery' });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to download gallery' });
+    }
   }
+});
+
+// Error handling middleware for multer errors
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ 
+        error: 'File too large. Maximum file size is 10MB per file. Please compress your images/videos or use smaller files.' 
+      });
+    }
+    if (err.code === 'LIMIT_FILE_COUNT') {
+      return res.status(400).json({ 
+        error: 'Too many files. Maximum 20 files per upload.' 
+      });
+    }
+    return res.status(400).json({ error: err.message });
+  }
+  
+  if (err.message && err.message.includes('Invalid file type')) {
+    return res.status(400).json({ error: err.message });
+  }
+  
+  next(err);
 });
 
 // Serve frontend - catch all routes not matched by API
 app.use((req, res, next) => {
-  if (!req.path.startsWith('/api/') && !req.path.startsWith('/uploads/')) {
+  if (!req.path.startsWith('/api/')) {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
   } else {
     next();
