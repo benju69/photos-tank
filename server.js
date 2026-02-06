@@ -32,6 +32,16 @@ const uploadLimiter = rateLimit({
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// Security headers
+app.use((req, res, next) => {
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'"
+  );
+  next();
+});
+
 app.use(express.static('public'));
 app.use('/uploads', express.static('uploads'));
 app.use('/api/', apiLimiter); // Apply rate limiting to all API routes
@@ -67,12 +77,66 @@ const storage = multer.diskStorage({
   }
 });
 
+// Allowed file types for uploads
+const ALLOWED_MIME_TYPES = new Set([
+  'image/jpeg',
+  'image/png',
+  'image/gif',
+  'image/webp',
+  'video/mp4',
+  'video/webm',
+  'video/ogg',
+  'video/quicktime',
+  'video/x-msvideo'
+]);
+
+const ALLOWED_EXTENSIONS = new Set([
+  '.jpg',
+  '.jpeg',
+  '.png',
+  '.gif',
+  '.webp',
+  '.mp4',
+  '.webm',
+  '.ogg',
+  '.mov',
+  '.avi'
+]);
+
 const upload = multer({ 
   storage,
-  limits: { fileSize: 100 * 1024 * 1024 } // 100MB limit
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB limit
+  fileFilter: (req, file, cb) => {
+    const ext = path.extname(file.originalname || '').toLowerCase();
+
+    if (ALLOWED_MIME_TYPES.has(file.mimetype) && ALLOWED_EXTENSIONS.has(ext)) {
+      return cb(null, true);
+    }
+
+    return cb(new Error('Invalid file type. Only image and video uploads are allowed.'), false);
+  }
 });
 
 // Helper functions
+
+// Sanitize user input to prevent XSS
+function sanitizeInput(input) {
+  if (typeof input !== 'string') return '';
+  return input
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;')
+    .replace(/\//g, '&#x2F;');
+}
+
+// Validate input length
+function validateInputLength(input, maxLength = 500) {
+  if (typeof input !== 'string') return false;
+  return input.length > 0 && input.length <= maxLength;
+}
+
 function readEvents() {
   try {
     const data = fs.readFileSync(EVENTS_FILE, 'utf8');
@@ -103,6 +167,20 @@ function findEvent(eventId) {
 app.post('/api/events', async (req, res) => {
   try {
     const { name, description } = req.body;
+    
+    // Validate inputs
+    if (!name || !validateInputLength(name, 200)) {
+      return res.status(400).json({ error: 'Event name is required and must be less than 200 characters' });
+    }
+    
+    if (description && !validateInputLength(description, 1000)) {
+      return res.status(400).json({ error: 'Description must be less than 1000 characters' });
+    }
+    
+    // Sanitize inputs
+    const sanitizedName = sanitizeInput(name);
+    const sanitizedDescription = description ? sanitizeInput(description) : '';
+    
     const eventId = uuidv4();
     const eventLink = `${req.protocol}://${req.get('host')}/event/${eventId}`;
     
@@ -111,8 +189,8 @@ app.post('/api/events', async (req, res) => {
     
     const newEvent = {
       id: eventId,
-      name,
-      description,
+      name: sanitizedName,
+      description: sanitizedDescription,
       createdAt: new Date().toISOString(),
       link: eventLink,
       qrCode,
@@ -163,44 +241,115 @@ app.get('/api/events/:eventId', (req, res) => {
 
 // Upload files to an event
 app.post('/api/events/:eventId/upload', uploadLimiter, upload.array('files', 20), (req, res) => {
+  const uploadedFiles = req.files || [];
+  
   try {
     const { eventId } = req.params;
     const { guestName, message } = req.body;
     
+    // Validate inputs
+    if (!guestName || !validateInputLength(guestName, 100)) {
+      // Clean up uploaded files
+      uploadedFiles.forEach(file => {
+        try {
+          fs.unlinkSync(file.path);
+        } catch (err) {
+          console.error('Error deleting file:', file.path, err);
+        }
+      });
+      return res.status(400).json({ error: 'Guest name is required and must be less than 100 characters' });
+    }
+    
+    if (message && !validateInputLength(message, 500)) {
+      // Clean up uploaded files
+      uploadedFiles.forEach(file => {
+        try {
+          fs.unlinkSync(file.path);
+        } catch (err) {
+          console.error('Error deleting file:', file.path, err);
+        }
+      });
+      return res.status(400).json({ error: 'Message must be less than 500 characters' });
+    }
+    
+    // Sanitize inputs
+    const sanitizedGuestName = sanitizeInput(guestName);
+    const sanitizedMessage = message ? sanitizeInput(message) : '';
+    
     const event = findEvent(eventId);
     if (!event) {
+      // Clean up uploaded files
+      uploadedFiles.forEach(file => {
+        try {
+          fs.unlinkSync(file.path);
+        } catch (err) {
+          console.error('Error deleting file:', file.path, err);
+        }
+      });
       return res.status(404).json({ error: 'Event not found' });
     }
     
-    const uploadedFiles = req.files.map(file => ({
+    const uploadedFileRecords = uploadedFiles.map(file => ({
       id: uuidv4(),
       filename: file.filename,
       originalName: file.originalname,
       path: `/uploads/${eventId}/${file.filename}`,
       type: file.mimetype,
       size: file.size,
-      guestName,
-      message: message || '',
+      guestName: sanitizedGuestName,
+      message: sanitizedMessage,
       uploadedAt: new Date().toISOString()
     }));
     
-    event.uploads.push(...uploadedFiles);
+    event.uploads.push(...uploadedFileRecords);
     
     const events = readEvents();
     const eventIndex = events.findIndex(e => e.id === eventId);
     if (eventIndex === -1) {
+      // Clean up uploaded files
+      uploadedFiles.forEach(file => {
+        try {
+          fs.unlinkSync(file.path);
+        } catch (err) {
+          console.error('Error deleting file:', file.path, err);
+        }
+      });
       return res.status(404).json({ error: 'Event not found in database' });
     }
+    
     events[eventIndex] = event;
-    writeEvents(events);
+    
+    try {
+      writeEvents(events);
+    } catch (writeError) {
+      // If database write fails, clean up uploaded files to prevent orphaned files
+      uploadedFiles.forEach(file => {
+        try {
+          fs.unlinkSync(file.path);
+        } catch (err) {
+          console.error('Error deleting file:', file.path, err);
+        }
+      });
+      throw writeError;
+    }
     
     res.json({ 
       success: true, 
-      files: uploadedFiles,
-      message: `Successfully uploaded ${uploadedFiles.length} file(s)`
+      files: uploadedFileRecords,
+      message: `Successfully uploaded ${uploadedFileRecords.length} file(s)`
     });
   } catch (error) {
     console.error('Error uploading files:', error);
+    // Clean up uploaded files on any error
+    uploadedFiles.forEach(file => {
+      try {
+        if (fs.existsSync(file.path)) {
+          fs.unlinkSync(file.path);
+        }
+      } catch (err) {
+        console.error('Error deleting file:', file.path, err);
+      }
+    });
     res.status(500).json({ error: 'Failed to upload files' });
   }
 });
@@ -236,8 +385,10 @@ app.get('/api/events/:eventId/download', (req, res) => {
       return res.status(404).json({ error: 'No files to download' });
     }
     
+    const safeEventName = event.name.replace(/[^a-z0-9]/gi, '_');
+    const safeEventId = String(req.params.eventId).slice(0, 8);
     res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', `attachment; filename="${event.name.replace(/[^a-z0-9]/gi, '_')}_gallery.zip"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${safeEventName}_${safeEventId}_gallery.zip"`);
     
     const archive = archiver('zip', {
       zlib: { level: 9 }
@@ -245,7 +396,11 @@ app.get('/api/events/:eventId/download', (req, res) => {
     
     archive.on('error', (err) => {
       console.error('Archive error:', err);
-      res.status(500).send({ error: err.message });
+      if (!res.headersSent) {
+        res.status(500).json({ error: err.message });
+      } else {
+        res.end();
+      }
     });
     
     archive.pipe(res);

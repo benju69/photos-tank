@@ -343,7 +343,31 @@
     let currentView = 'home';
     let currentEvent = null;
     let selectedFiles = [];
+    let galleryRefreshInterval = null;
+    let objectURLs = [];
 
+    // HTML escape function to prevent XSS
+    function escapeHtml(text) {
+      if (!text) return '';
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    // Clean up object URLs to prevent memory leaks
+    function revokeObjectURLs() {
+      objectURLs.forEach(url => URL.revokeObjectURL(url));
+      objectURLs = [];
+    }
+
+    // Clear gallery refresh interval
+    function clearGalleryInterval() {
+      if (galleryRefreshInterval) {
+        clearInterval(galleryRefreshInterval);
+        galleryRefreshInterval = null;
+      }
+    }
+    
     // Initialize app
     function init() {
       const pathParts = window.location.pathname.split('/');
@@ -434,28 +458,47 @@
 
     function showEventDetails(event) {
       const content = document.getElementById('tabContent');
-      content.innerHTML = `
-        <div class="card">
-          <h2>🎉 Event Created Successfully!</h2>
-          <h3>${event.name}</h3>
-          ${event.description ? `<p>${event.description}</p>` : ''}
-          
-          <div class="qr-container">
-            <h4>Share this QR Code with your guests</h4>
-            <img src="${event.qrCode}" alt="Event QR Code">
-            <div class="share-link">
-              <strong>Or share this link:</strong><br>
-              <a href="${event.link}" target="_blank">${event.link}</a>
-            </div>
-          </div>
-          
-          <div style="margin-top: 30px; text-align: center;">
-            <button class="btn" onclick="window.location.href='/admin/${event.id}'">
-              Manage Event & View Gallery
-            </button>
-          </div>
+      const card = document.createElement('div');
+      card.className = 'card';
+      
+      const title = document.createElement('h2');
+      title.textContent = '🎉 Event Created Successfully!';
+      card.appendChild(title);
+      
+      const eventName = document.createElement('h3');
+      eventName.textContent = event.name;
+      card.appendChild(eventName);
+      
+      if (event.description) {
+        const desc = document.createElement('p');
+        desc.textContent = event.description;
+        card.appendChild(desc);
+      }
+      
+      const qrContainer = document.createElement('div');
+      qrContainer.className = 'qr-container';
+      qrContainer.innerHTML = `
+        <h4>Share this QR Code with your guests</h4>
+        <img src="${escapeHtml(event.qrCode)}" alt="Event QR Code">
+        <div class="share-link">
+          <strong>Or share this link:</strong><br>
+          <a href="${escapeHtml(event.link)}" target="_blank">${escapeHtml(event.link)}</a>
         </div>
       `;
+      card.appendChild(qrContainer);
+      
+      const buttonDiv = document.createElement('div');
+      buttonDiv.style.marginTop = '30px';
+      buttonDiv.style.textAlign = 'center';
+      buttonDiv.innerHTML = `
+        <button class="btn" onclick="window.location.href='/admin/${escapeHtml(event.id)}'">
+          Manage Event & View Gallery
+        </button>
+      `;
+      card.appendChild(buttonDiv);
+      
+      content.innerHTML = '';
+      content.appendChild(card);
     }
 
     async function loadMyEvents() {
@@ -474,34 +517,53 @@
         const response = await fetch(`${API_BASE}/api/events`);
         const events = await response.json();
         
+        const card = document.createElement('div');
+        card.className = 'card';
+        
+        const title = document.createElement('h2');
+        title.textContent = 'My Events';
+        card.appendChild(title);
+        
         if (events.length === 0) {
-          content.innerHTML = `
-            <div class="card">
-              <h2>My Events</h2>
-              <p>No events yet. Create your first event to get started!</p>
-            </div>
-          `;
+          const msg = document.createElement('p');
+          msg.textContent = 'No events yet. Create your first event to get started!';
+          card.appendChild(msg);
         } else {
-          content.innerHTML = `
-            <div class="card">
-              <h2>My Events</h2>
-              <div class="events-list">
-                ${events.map(event => `
-                  <div class="event-card" onclick="window.location.href='/admin/${event.id}'">
-                    <h3>${event.name}</h3>
-                    <p>${event.uploads ? event.uploads.length : 0} uploads</p>
-                    <p style="font-size: 12px; color: #999;">Created: ${new Date(event.createdAt).toLocaleDateString()}</p>
-                  </div>
-                `).join('')}
-              </div>
-            </div>
-          `;
+          const eventsList = document.createElement('div');
+          eventsList.className = 'events-list';
+          
+          events.forEach(event => {
+            const eventCard = document.createElement('div');
+            eventCard.className = 'event-card';
+            eventCard.onclick = () => window.location.href = `/admin/${escapeHtml(event.id)}`;
+            
+            const eventTitle = document.createElement('h3');
+            eventTitle.textContent = event.name;
+            eventCard.appendChild(eventTitle);
+            
+            const uploads = document.createElement('p');
+            uploads.textContent = `${event.uploads ? event.uploads.length : 0} uploads`;
+            eventCard.appendChild(uploads);
+            
+            const created = document.createElement('p');
+            created.style.fontSize = '12px';
+            created.style.color = '#999';
+            created.textContent = `Created: ${new Date(event.createdAt).toLocaleDateString()}`;
+            eventCard.appendChild(created);
+            
+            eventsList.appendChild(eventCard);
+          });
+          
+          card.appendChild(eventsList);
         }
+        
+        content.innerHTML = '';
+        content.appendChild(card);
       } catch (error) {
         content.innerHTML = `
           <div class="card">
             <h2>My Events</h2>
-            <p>Failed to load events: ${error.message}</p>
+            <p>Failed to load events: ${escapeHtml(error.message)}</p>
           </div>
         `;
       }
@@ -572,6 +634,9 @@
     }
 
     async function loadAdminView(eventId) {
+      // Clear any existing interval
+      clearGalleryInterval();
+      
       const app = document.getElementById('app');
       
       try {
@@ -579,44 +644,76 @@
         if (!response.ok) throw new Error('Event not found');
         const event = await response.json();
         
-        app.innerHTML = `
-          <div class="card">
-            <h2>🎉 ${event.name}</h2>
-            ${event.description ? `<p>${event.description}</p>` : ''}
-            
-            <div class="qr-container">
-              <h4>Share with Guests</h4>
-              <img src="${event.qrCode}" alt="Event QR Code" style="max-width: 200px;">
-              <div class="share-link">
-                <strong>Guest Link:</strong><br>
-                <a href="${event.link}" target="_blank">${event.link}</a>
-              </div>
-            </div>
-            
-            <button class="btn download-btn" onclick="downloadGallery('${eventId}', '${event.name}')" style="width: 100%;">
-              📥 Download All Photos & Videos (ZIP)
-            </button>
-            
-            <div style="margin-top: 20px; text-align: center;">
-              <button class="btn" onclick="window.location.href='/'">
-                ← Back to Events
-              </button>
-            </div>
-          </div>
-          
-          <div class="card">
-            <h3>Event Gallery (${event.uploads ? event.uploads.length : 0} uploads)</h3>
-            <div id="gallery" class="loading">
-              <div class="spinner"></div>
-              Loading gallery...
-            </div>
+        const container = document.createElement('div');
+        
+        // First card
+        const card1 = document.createElement('div');
+        card1.className = 'card';
+        
+        const title = document.createElement('h2');
+        title.textContent = `🎉 ${event.name}`;
+        card1.appendChild(title);
+        
+        if (event.description) {
+          const desc = document.createElement('p');
+          desc.textContent = event.description;
+          card1.appendChild(desc);
+        }
+        
+        const qrContainer = document.createElement('div');
+        qrContainer.className = 'qr-container';
+        qrContainer.innerHTML = `
+          <h4>Share with Guests</h4>
+          <img src="${escapeHtml(event.qrCode)}" alt="Event QR Code" style="max-width: 200px;">
+          <div class="share-link">
+            <strong>Guest Link:</strong><br>
+            <a href="${escapeHtml(event.link)}" target="_blank">${escapeHtml(event.link)}</a>
           </div>
         `;
+        card1.appendChild(qrContainer);
+        
+        const downloadBtn = document.createElement('button');
+        downloadBtn.className = 'btn download-btn';
+        downloadBtn.style.width = '100%';
+        downloadBtn.textContent = '📥 Download All Photos & Videos (ZIP)';
+        downloadBtn.onclick = () => downloadGallery(eventId, event.name);
+        card1.appendChild(downloadBtn);
+        
+        const backDiv = document.createElement('div');
+        backDiv.style.marginTop = '20px';
+        backDiv.style.textAlign = 'center';
+        backDiv.innerHTML = `
+          <button class="btn" onclick="clearGalleryInterval(); window.location.href='/'">
+            ← Back to Events
+          </button>
+        `;
+        card1.appendChild(backDiv);
+        
+        container.appendChild(card1);
+        
+        // Second card
+        const card2 = document.createElement('div');
+        card2.className = 'card';
+        
+        const galleryTitle = document.createElement('h3');
+        galleryTitle.textContent = `Event Gallery (${event.uploads ? event.uploads.length : 0} uploads)`;
+        card2.appendChild(galleryTitle);
+        
+        const galleryDiv = document.createElement('div');
+        galleryDiv.id = 'gallery';
+        galleryDiv.className = 'loading';
+        galleryDiv.innerHTML = '<div class="spinner"></div>Loading gallery...';
+        card2.appendChild(galleryDiv);
+        
+        container.appendChild(card2);
+        
+        app.innerHTML = '';
+        app.appendChild(container);
         
         loadGallery(eventId);
         
         // Auto-refresh gallery every 10 seconds
-        setInterval(() => loadGallery(eventId), 10000);
+        galleryRefreshInterval = setInterval(() => loadGallery(eventId), 10000);
         
       } catch (error) {
         app.innerHTML = `
@@ -655,12 +752,22 @@
     }
 
     function handleFiles(files) {
-      selectedFiles = files;
-      displayFilePreview(files);
-      document.getElementById('uploadBtn').disabled = files.length === 0;
+      const MAX_FILE_SIZE_PER_FILE = 100 * 1024 * 1024; // 100MB
+      const validFiles = files.filter(file => file.size <= MAX_FILE_SIZE_PER_FILE);
+      
+      if (validFiles.length !== files.length) {
+        alert('Some files were too large and have been skipped. Maximum size is 100MB per file.');
+      }
+      
+      selectedFiles = validFiles;
+      displayFilePreview(validFiles);
+      document.getElementById('uploadBtn').disabled = validFiles.length === 0;
     }
 
     function displayFilePreview(files) {
+      // Clean up previous object URLs
+      revokeObjectURLs();
+      
       const preview = document.getElementById('filePreview');
       preview.innerHTML = '';
       
@@ -670,11 +777,15 @@
         
         if (file.type.startsWith('image/')) {
           const img = document.createElement('img');
-          img.src = URL.createObjectURL(file);
+          const url = URL.createObjectURL(file);
+          objectURLs.push(url);
+          img.src = url;
           item.appendChild(img);
         } else if (file.type.startsWith('video/')) {
           const video = document.createElement('video');
-          video.src = URL.createObjectURL(file);
+          const url = URL.createObjectURL(file);
+          objectURLs.push(url);
+          video.src = url;
           item.appendChild(video);
         }
         
@@ -726,6 +837,7 @@
         document.getElementById('guestMessage').value = '';
         document.getElementById('fileInput').value = '';
         selectedFiles = [];
+        revokeObjectURLs();
         document.getElementById('filePreview').innerHTML = '';
         uploadBtn.disabled = true;
         uploadBtn.textContent = 'Upload Files';
@@ -747,6 +859,7 @@
 
     async function loadGallery(eventId) {
       const gallery = document.getElementById('gallery');
+      if (!gallery) return;
       
       try {
         const response = await fetch(`${API_BASE}/api/events/${eventId}/gallery`);
@@ -762,27 +875,61 @@
           new Date(b.uploadedAt) - new Date(a.uploadedAt)
         );
         
-        gallery.innerHTML = `
-          <div class="gallery-grid">
-            ${sortedUploads.map(upload => `
-              <div class="gallery-item">
-                ${upload.type.startsWith('image/') ? 
-                  `<img src="${upload.path}" alt="${upload.originalName}">` :
-                  `<video src="${upload.path}" controls></video>`
-                }
-                <div class="gallery-item-info">
-                  <div class="guest-name">👤 ${upload.guestName}</div>
-                  ${upload.message ? `<div class="message">"${upload.message}"</div>` : ''}
-                  <div style="font-size: 12px; color: #999; margin-top: 5px;">
-                    ${new Date(upload.uploadedAt).toLocaleString()}
-                  </div>
-                </div>
-              </div>
-            `).join('')}
-          </div>
-        `;
+        const galleryGrid = document.createElement('div');
+        galleryGrid.className = 'gallery-grid';
+        
+        sortedUploads.forEach(upload => {
+          const item = document.createElement('div');
+          item.className = 'gallery-item';
+          
+          // Create media element
+          if (upload.type.startsWith('image/')) {
+            const img = document.createElement('img');
+            img.src = escapeHtml(upload.path);
+            img.alt = escapeHtml(upload.originalName);
+            item.appendChild(img);
+          } else {
+            const video = document.createElement('video');
+            video.src = escapeHtml(upload.path);
+            video.controls = true;
+            item.appendChild(video);
+          }
+          
+          // Create info section
+          const info = document.createElement('div');
+          info.className = 'gallery-item-info';
+          
+          const guestName = document.createElement('div');
+          guestName.className = 'guest-name';
+          guestName.textContent = `👤 ${upload.guestName}`;
+          info.appendChild(guestName);
+          
+          if (upload.message) {
+            const message = document.createElement('div');
+            message.className = 'message';
+            message.textContent = `"${upload.message}"`;
+            info.appendChild(message);
+          }
+          
+          const timestamp = document.createElement('div');
+          timestamp.style.fontSize = '12px';
+          timestamp.style.color = '#999';
+          timestamp.style.marginTop = '5px';
+          timestamp.textContent = new Date(upload.uploadedAt).toLocaleString();
+          info.appendChild(timestamp);
+          
+          item.appendChild(info);
+          galleryGrid.appendChild(item);
+        });
+        
+        gallery.innerHTML = '';
+        gallery.appendChild(galleryGrid);
       } catch (error) {
-        gallery.innerHTML = `<p style="color: red;">Failed to load gallery: ${error.message}</p>`;
+        const errorMsg = document.createElement('p');
+        errorMsg.style.color = 'red';
+        errorMsg.textContent = `Failed to load gallery: ${error.message}`;
+        gallery.innerHTML = '';
+        gallery.appendChild(errorMsg);
       }
     }
 
